@@ -18,6 +18,8 @@ final class ClaudeProfileState {
     var updated: Date?
     var lastSuccessAt: Date?
     var lastError: Error?
+    /// Delay until the next poll after a transient failure, shown while there is no value.
+    var retryDelay: TimeInterval?
     var consecutiveFailures = 0
     var inFlight = false
     var timer: Timer?
@@ -35,6 +37,21 @@ final class ClaudeProfileState {
         if case UsageError.auth? = lastError as? UsageError { return true }
         return false
     }
+}
+
+/// Status lines under a Claude section header. No value yet: "Loading...", or the error — plus,
+/// for a transient failure (never an auth one), when the next try is. With a value: the stale
+/// warning once `shouldShowStale`. Never a login prompt; that is the login item's job.
+func claudeStatusNotes(
+    hasValue: Bool, error: String?, loginNeeded: Bool, retryDelay: TimeInterval?, stale: Bool
+) -> [String] {
+    guard hasValue else {
+        guard let error else { return ["Loading..."] }
+        if !loginNeeded, let retryDelay { return [error, formatRetryIn(retryDelay)] }
+        return [error]
+    }
+    if let error, stale { return ["⚠ Refresh failed — showing last value", error] }
+    return []
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -100,6 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastCodexTokens: TokenStats?
     private var lastCodexUpdated: Date?
     private var codexLoginNeeded = false
+    private var codexError: Error?
     private var codexInFlight = false
 
     // Auto Wakeup: off unless the user turns it on. State is persisted so quitting and
@@ -260,8 +278,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        setStacked(top: "··", bottom: "··", color: nil)
-        rebuildMenu(detailLines: ["Loading..."])
+        renderAll()  // every section starts as "Loading..."
 
         refreshAll()
         // Sessions open and close far more often than the usage poll; a local `ps` scan is cheap.
@@ -327,6 +344,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await MainActor.run {
                     state.inFlight = false
                     state.lastError = nil
+                    state.retryDelay = nil
                     state.account = account
                     state.accountText = accountLine(account, plan: plan)
                     self.renderUsage(state, usage, model, tokens)
@@ -625,55 +643,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastCodexTokens = tokens
         lastCodexUpdated = Date()
         codexLoginNeeded = false
-        if lastUsage != nil {
-            renderAll()
-        } else {
-            // Codex only (no Claude value yet): 5h on top, weekly below, like the Claude-only layout.
-            let color = colorForPercent(usage.fiveHour.usedPercent)
-            setStacked(
-                top: "\(usage.fiveHour.usedPercent)%",
-                bottom: usage.weekly.map { "\($0.usedPercent)%" } ?? "··",
-                topColor: color, bottomColor: color, topIcon: lineIcon(.codex))
-            var lines = [
-                "Codex 5h: \(usage.fiveHour.usedPercent)% · \(formatResetIn(usage.fiveHour.resetsAt))"
-            ]
-            if let weekly = usage.weekly {
-                lines.append("Codex Weekly: \(weekly.usedPercent)% · \(formatResetIn(weekly.resetsAt))")
-            }
-            if let tokens { lines.append(tokenMenuTitles(tokens).today) }
-            if let at = lastCodexUpdated {
-                lines.append("Updated: \(clockString(at))")
-            }
-            rebuildMenu(detailLines: lines)
-        }
+        codexError = nil
+        renderAll()
     }
 
+    /// A Codex failure only changes the Codex section; the Claude sections keep their own state.
     private func handleCodexError(_ error: Error) {
+        codexError = error
         if case CodexUsageError.credentialsNotFound = error {
             codexLoginNeeded = true
-            if lastUsage != nil {
-                renderAll()
-            } else {
-                setStacked(
-                    top: "Login", bottom: "needed", topColor: .systemRed, bottomColor: .systemRed,
-                    topIcon: lineIcon(.codex))
-                rebuildMenu(detailLines: [error.localizedDescription], showCodexLogin: true)
-            }
         } else if case CodexUsageError.auth = error {
             codexLoginNeeded = true
-            if lastUsage != nil {
-                renderAll()
-            } else {
-                setStacked(
-                    top: "Login", bottom: "needed", topColor: .systemRed, bottomColor: .systemRed,
-                    topIcon: lineIcon(.codex))
-                rebuildMenu(detailLines: [error.localizedDescription], showCodexLogin: true)
-            }
-        } else if lastUsage != nil {
-            renderAll()
-        } else {
-            rebuildMenu(detailLines: [error.localizedDescription])
         }
+        renderAll()
     }
 
     // MARK: - Rendering
@@ -697,49 +679,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func redrawMenu() {
         if let build = lastMenuBuild {
             build()
-        } else if lastUsage != nil {
+        } else {
             renderAll()
         }
     }
 
     /// Redraw for a new primary profile from cached state only — switching never polls.
     private func renderPrimaryFromCache() {
-        if lastUsage != nil {
-            renderAll()
-        } else if let error = primary.lastError {
-            if primary.loginNeeded {
-                setStacked(top: "Login", bottom: "needed", color: .systemRed)
-            } else {
-                setStacked(top: "··", bottom: "··", color: .systemGray)
-            }
-            rebuildMenu(detailLines: [primaryErrorLine(error)], showLogin: primary.loginNeeded)
-        } else {
-            setStacked(top: "··", bottom: "··", color: nil)
-            rebuildMenu(detailLines: ["Loading..."])
-        }
+        renderAll()
     }
 
-    /// The primary profile's error text, naming the profile once there is more than one.
-    private func primaryErrorLine(_ error: Error) -> String {
-        multiProfile ? "\(primary.profile.label): \(error.localizedDescription)" : error.localizedDescription
-    }
-
-    /// One Claude profile's dropdown section. Status notes (stale / error / loading) are only
-    /// added for non-primary profiles; the primary's status keeps its own whole-menu paths.
-    private func claudeSection(_ state: ClaudeProfileState, withStatus: Bool) -> ProviderSection {
-        var notes: [String] = []
-        if withStatus {
-            if state.usage == nil {
-                notes.append(state.lastError?.localizedDescription ?? "Loading...")
-            } else if state.lastError != nil {
-                let age = state.lastSuccessAt.map { Date().timeIntervalSince($0) } ?? .greatestFiniteMagnitude
-                if shouldShowStale(age, interval) { notes.append("⚠ Refresh failed — showing last value") }
-            }
-        }
+    /// One Claude profile's dropdown section, with its status notes: "Loading...", the error
+    /// (plus the retry time for a transient failure with no value), or the stale warning.
+    private func claudeSection(_ state: ClaudeProfileState) -> ProviderSection {
+        let notes = claudeStatusNotes(
+            hasValue: state.usage != nil, error: state.lastError?.localizedDescription,
+            loginNeeded: state.loginNeeded, retryDelay: state.retryDelay, stale: isStale(state))
+        // A profile hidden as a duplicate of this account still has its own transcripts (each
+        // config dir has its own projects/), so its tokens and model show here instead of vanishing.
+        let sameAccount = sameAccountStates(state)
+        let tokens = combinedTokenStats(sameAccount.compactMap(\.tokens))
+        let model = sameAccount.lazy.compactMap(\.model).first
         return ProviderSection(
-            rows: state.usage.map(claudeRows) ?? [], model: state.model, tokens: state.tokens,
+            rows: state.usage.map(claudeRows) ?? [], model: model, tokens: tokens,
             title: multiProfile ? "\(Provider.claude.displayName) · \(state.profile.label)" : nil,
             account: state.accountText, notes: notes, inVSCode: inVSCode(state))
+    }
+
+    /// `state` first, then every other profile logged into the same account (and org) — the
+    /// ones `secondaries` hides behind it.
+    private func sameAccountStates(_ state: ClaudeProfileState) -> [ClaudeProfileState] {
+        guard let id = state.account?.identity else { return [state] }
+        return [state] + claudeStates.filter { $0 !== state && $0.account?.identity == id }
+    }
+
+    private func isStale(_ state: ClaudeProfileState) -> Bool {
+        guard state.lastError != nil else { return false }
+        let age = state.lastSuccessAt.map { Date().timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        return shouldShowStale(age, interval)
     }
 
     private func claudeRows(_ usage: UsageData) -> [UsageRow] {
@@ -767,11 +744,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return claudeRows
     }
 
-    /// Redraw the status item and dropdown from cached state (all providers). Used by the
-    /// Codex paths too, so a Codex-only poll never touches a Claude "Updated" time.
+    /// Redraw the status item and dropdown from cached state (all providers). The one layout for
+    /// every state: the primary Claude section is always present — loading, failed or logged out
+    /// it shows that status — so a Codex poll can never replace it.
     private func renderAll() {
-        guard lastUsage != nil else { return }
-
         renderPrimaryDisplay()
 
         var codexSection: ProviderSection?
@@ -784,14 +760,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 codexRows.append(UsageRow(label: "Weekly", pct: weekly.usedPercent,
                                           reset: formatResetDuration(weekly.resetsAt)))
             }
-            codexSection = ProviderSection(rows: codexRows, model: lastCodexModel, tokens: lastCodexTokens)
+            let notes = codexError.map { ["⚠ Refresh failed — showing last value", $0.localizedDescription] } ?? []
+            codexSection = ProviderSection(rows: codexRows, model: lastCodexModel, tokens: lastCodexTokens, notes: notes)
+        } else if let error = codexError {
+            codexSection = ProviderSection(rows: [], model: nil, tokens: lastCodexTokens, notes: [error.localizedDescription])
         }
 
         let claudeUpdated = claudeStates.reduce(nil as Date?) { latestDate($0, $1.updated) }
         rebuildMenu(
-            claude: claudeSection(primary, withStatus: false),
+            claude: claudeSection(primary),
             codex: codexSection,
             updatedAt: latestDate(claudeUpdated, lastCodexUpdated),
+            showLogin: primary.loginNeeded,
             showCodexLogin: codexLoginNeeded)
     }
 
@@ -799,13 +779,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// status item can be hidden by macOS when the menu bar is crowded, so the
     /// primary item is the reliable display path for Codex too.
     private func renderPrimaryDisplay() {
-        guard let usage = lastUsage else { return }
+        guard let usage = lastUsage else {
+            renderPrimaryPlaceholder()
+            return
+        }
+        // A stale primary value is grayed (error contract); Codex keeps its own colour.
+        let stale = isStale(primary)
         if let codex = lastCodexUsage {
             let claudePercent = pct(usage.fiveHour.utilization)
             setStacked(
                 top: "\(claudePercent)%",
                 bottom: "\(codex.fiveHour.usedPercent)%",
-                topColor: colorForPercent(claudePercent),
+                topColor: stale ? .systemGray : colorForPercent(claudePercent),
                 bottomColor: colorForPercent(codex.fiveHour.usedPercent),
                 topGauge: resetProgress(until: usage.fiveHour.resetsAt),
                 bottomGauge: resetProgress(until: codex.fiveHour.resetsAt),
@@ -819,64 +804,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setStacked(
                 top: "\(pct(usage.fiveHour.utilization))%",
                 bottom: "\(pct(usage.sevenDay.utilization))%",
-                color: colorForPeak(peakUtilization(usage)))
+                color: stale ? .systemGray : colorForPeak(peakUtilization(usage)))
             statusItem.button?.toolTip = nil
+        }
+    }
+
+    /// The menu-bar title while the primary Claude profile has no value: its login prompt, or a
+    /// neutral `··` (gray once a poll failed) — next to Codex's 5h when Codex has a value.
+    private func renderPrimaryPlaceholder() {
+        statusItem.button?.toolTip = nil
+        if primary.loginNeeded {
+            setStacked(top: "Login", bottom: "needed", color: .systemRed)
+        } else if let codex = lastCodexUsage {
+            setStacked(
+                top: "··", bottom: "\(codex.fiveHour.usedPercent)%",
+                topColor: .systemGray, bottomColor: colorForPercent(codex.fiveHour.usedPercent),
+                bottomGauge: resetProgress(until: codex.fiveHour.resetsAt),
+                topIcon: lineIcon(.claude), bottomIcon: lineIcon(.codex))
+        } else {
+            setStacked(top: "··", bottom: "··", color: primary.lastError == nil ? nil : .systemGray)
         }
     }
 
     /// A failed poll of one profile: the primary drives the whole display, any other profile only
     /// its own section. Returns the delay (seconds) until that profile's next poll.
     private func handleError(_ error: Error, for state: ClaudeProfileState) -> TimeInterval {
-        if state === primary { return handleError(error) }
         let delay: TimeInterval
         if state.loginNeeded {
             state.consecutiveFailures = 0
             delay = interval
         } else {
+            // Transient error: retry with backoff. The delay is stored so it can be displayed.
             state.consecutiveFailures += 1
             delay = nextRetryDelay(state.consecutiveFailures, interval, retryAfter(from: error))
         }
-        redrawMenu()
+        state.retryDelay = state.loginNeeded ? nil : delay
+        if state === primary { renderAll() } else { redrawMenu() }
         return delay
-    }
-
-    /// Update the error display and return the delay (seconds) until the next poll.
-    private func handleError(_ error: Error) -> TimeInterval {
-        if error is CredentialsError || isAuthError(error) {
-            setStacked(top: "Login", bottom: "needed", color: .systemRed)
-            rebuildMenu(detailLines: [primaryErrorLine(error)], showLogin: true)
-            consecutiveFailures = 0
-            return interval
-        }
-        // Transient error: retry with backoff. Compute the delay first so it can be displayed.
-        consecutiveFailures += 1
-        let delay = nextRetryDelay(consecutiveFailures, interval, retryAfter(from: error))
-        let age = lastSuccessAt.map { Date().timeIntervalSince($0) } ?? .greatestFiniteMagnitude
-        if let usage = lastUsage, !shouldShowStale(age, interval) {
-            _ = usage  // still fresh -> no display change (no-op)
-        } else if let usage = lastUsage {
-            setStacked(
-                top: "\(pct(usage.fiveHour.utilization))%",
-                bottom: "\(pct(usage.sevenDay.utilization))%",
-                color: .systemGray
-            )
-            rebuildMenu(detailLines: [
-                "⚠ Refresh failed — showing last value",
-                primaryErrorLine(error),
-            ])
-        } else {
-            // No value to fall back on. This is a transient failure (network, HTTP 429), NOT an
-            // auth problem: show a neutral placeholder and no Login item, so the user is not sent
-            // on a pointless login round trip that cannot fix a rate limit.
-            setStacked(top: "··", bottom: "··", color: .systemGray)
-            rebuildMenu(detailLines: [primaryErrorLine(error), formatRetryIn(delay)])
-        }
-        return delay
-    }
-
-    private func isAuthError(_ error: Error) -> Bool {
-        if case UsageError.auth = error { return true }
-        return false
     }
 
     private func colorForPeak(_ peak: Double) -> NSColor? {
@@ -924,35 +888,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         provider.icon(pointSize: providerIconSize(fontSize: fontSize))
     }
 
-    /// Plain text rows (used by the error / auth / "Loading..." paths). Not column-aligned.
-    private func rebuildMenu(detailLines: [String], showLogin: Bool = false, showCodexLogin: Bool = false) {
-        lastMenuBuild = { [weak self] in
-            self?.rebuildMenu(detailLines: detailLines, showLogin: showLogin, showCodexLogin: showCodexLogin)
-        }
-        let menu = NSMenu()
-        menu.autoenablesItems = false  // so the info lines are not shown dimmed (disabled)
-        for line in detailLines {
-            let item = NSMenuItem(title: line, action: nil, keyEquivalent: "")
-            item.isEnabled = true
-            item.attributedTitle = NSAttributedString(
-                string: line,
-                attributes: [
-                    .font: NSFont.menuFont(ofSize: 0),
-                    .foregroundColor: NSColor.labelColor,
-                ]
-            )
-            menu.addItem(item)
-        }
-        let others = secondaries.map { ($0, claudeSection($0, withStatus: true)) }
-        let widths = usageTableColumnWidths(sections: others.map { $0.1.rows })
-        for (state, section) in others {
-            menu.addItem(.separator())
-            appendSection(to: menu, .claude, section, widths: widths, caption: false, loginFor: state)
-        }
-        appendInteractiveItems(to: menu, showLogin: showLogin, showCodexLogin: showCodexLogin)
-        statusItem.menu = menu
-    }
-
     /// One provider section: header, account note, status notes, usage table, tokens row, and —
     /// for a non-primary profile that needs it — its own login item.
     private func appendSection(
@@ -991,13 +926,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// rides along on "Refresh Now" below, since it belongs to both providers (they poll on the
     /// same timer) and to the action that changes it.
     private func rebuildMenu(
-        claude: ProviderSection, codex: ProviderSection?, updatedAt: Date?, showCodexLogin: Bool = false
+        claude: ProviderSection, codex: ProviderSection?, updatedAt: Date?,
+        showLogin: Bool = false, showCodexLogin: Bool = false
     ) {
         lastMenuBuild = { [weak self] in self?.renderAll() }  // re-reads every profile's state
         let menu = NSMenu()
         menu.autoenablesItems = false
 
-        let others = secondaries.map { ($0, claudeSection($0, withStatus: true)) }
+        let others = secondaries.map { ($0, claudeSection($0)) }
         // One measurement over every row of every section: each section's table is its own
         // NSGridView, so without a shared width their columns would be sized independently
         // and the reset column would start at a different x in each section.
@@ -1015,7 +951,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             appendSection(to: menu, .codex, codex, widths: widths, caption: false)
         }
         appendInteractiveItems(
-            to: menu, showLogin: false, showCodexLogin: showCodexLogin, updatedAt: updatedAt)
+            to: menu, showLogin: showLogin, showCodexLogin: showCodexLogin, updatedAt: updatedAt)
         statusItem.menu = menu
     }
 
@@ -2204,6 +2140,82 @@ if CommandLine.arguments.contains("--selftest") {
           && tokensItem.submenu?.items.allSatisfy(\.isEnabled) == true,
           "makeTokensItem: dropdown row shows today only; 7d / 30d are its hover submenu")
 
+    // claudeStatusNotes: the primary section stays visible in every state (it used to be
+    // replaced by a Codex-only menu while the primary had no value).
+    check(claudeStatusNotes(hasValue: false, error: nil, loginNeeded: false, retryDelay: nil, stale: false) == ["Loading..."],
+          "claudeStatusNotes: loading")
+    check(claudeStatusNotes(hasValue: false, error: "usage API error: HTTP 429", loginNeeded: false, retryDelay: 300, stale: true)
+          == ["usage API error: HTTP 429", formatRetryIn(300)], "claudeStatusNotes: transient, no value -> error + retry in")
+    check(claudeStatusNotes(hasValue: false, error: "Authentication expired. Log in again.", loginNeeded: true, retryDelay: 300, stale: true)
+          == ["Authentication expired. Log in again."], "claudeStatusNotes: auth -> error only (login item separate)")
+    check(claudeStatusNotes(hasValue: true, error: "x", loginNeeded: false, retryDelay: 60, stale: false) == []
+          && claudeStatusNotes(hasValue: true, error: "x", loginNeeded: false, retryDelay: 60, stale: true)
+          == ["⚠ Refresh failed — showing last value", "x"], "claudeStatusNotes: stale only once shouldShowStale")
+
+    // combinedTokenStats: a duplicate profile's tokens fold into the shown one.
+    var partA = TokenStats(today: TokenTotals(input: 1), last7: TokenTotals(input: 2), prev7: TokenTotals(input: 3),
+                           last30: TokenTotals(input: 4), prev30: TokenTotals(input: 5))
+    partA.cost = CostStats(today: DayCost(usd: 1), last7: DayCost(usd: 2), last30: DayCost(usd: 3, unpriced: 1))
+    let partB = TokenStats(today: TokenTotals(output: 10), last7: TokenTotals(output: 20), prev7: nil,
+                           last30: TokenTotals(output: 40), prev30: TokenTotals(output: 50))
+    let both = combinedTokenStats([partA, partB])
+    check(both?.today == TokenTotals(input: 1, output: 10) && both?.prev7 == nil
+          && both?.prev30 == TokenTotals(input: 5, output: 50) && both?.cost == partA.cost,
+          "combinedTokenStats: sums windows, prior only when all known, cost from parts that have it")
+    check(combinedTokenStats([]) == nil && combinedTokenStats([partB]) == partB, "combinedTokenStats: empty / single")
+
+    // Pricing.swift: model prices, response cost, formatting.
+    check(modelPrice("claude-opus-5-5") == ModelPrice(input: 4, output: 20, cacheRead: 0.20)
+          && modelPrice("claude-opus-4-5-20251101") == modelPrice("claude-opus-4-5")
+          && modelPrice("gpt-6.1-sol")?.cacheRead == 0.10
+          && modelPrice("opus") == nil && modelPrice("<synthetic>") == nil && modelPrice("codex-auto-review") == nil,
+          "modelPrice: table, date suffix stripped, aliases / unknown unpriced")
+    let oneEach = TokenTotals(input: 1_000_000, output: 1_000_000, cacheRead: 1_000_000, cacheCreate: 2_000_000)
+    let opusCost = responseCost(oneEach, model: "claude-opus-5-5", cacheWrite1h: 1_000_000)
+    check(abs(opusCost.usd - (4 + 20 + 0.20 + 5 + 8)) < 1e-9 && opusCost.unpriced == 0,
+          "responseCost: input + output + cache read + 5m write 1.25x + 1h write 2x (got \(opusCost))")
+    check(abs(responseCost(oneEach, model: "claude-opus-5-5", cacheWrite1h: 1_000_000, multiplier: 2).usd - 2 * opusCost.usd) < 1e-9,
+          "responseCost: fast mode multiplier")
+    check(responseCost(oneEach, model: "mystery") == DayCost(usd: 0, unpriced: 5_000_000)
+          && responseCost(oneEach, model: nil).unpriced == 5_000_000, "responseCost: unknown model -> unpriced tokens")
+    check(formatUSD(DayCost(usd: 0.4249)) == "≈$0.42" && formatUSD(DayCost(usd: 12.345)) == "≈$12.35"
+          && formatUSD(DayCost(usd: 1234.4)) == "≈$1,234" && formatUSD(DayCost(usd: 3, unpriced: 1)) == "≈$3.00+",
+          "formatUSD")
+    let pricedLine = "{\"type\":\"assistant\",\"timestamp\":\"\(iso.string(from: dayA))\",\"message\":{\"id\":\"p\",\"model\":\"claude-sonnet-5-5\",\"usage\":{\"input_tokens\":1000000,\"output_tokens\":0,\"cache_creation_input_tokens\":1000000,\"cache_creation\":{\"ephemeral_1h_input_tokens\":1000000,\"ephemeral_5m_input_tokens\":0}}}}"
+    let pu = extractDailyUsage([pricedLine, pricedLine].joined(separator: "\n"))
+    check(pu.tokens == extractDailyTotals(pricedLine) && pu.cost.count == 1
+          && abs((pu.cost.values.first?.usd ?? 0) - (2 + 4)) < 1e-9,
+          "extractDailyUsage: priced by message.model, 1h writes at 2x, message.id counted once (got \(pu.cost))")
+    let cxu = extractCodexDailyUsage(codexRecords)
+    // r1: 400 in, 600 cached, 50 out; r2: 300 in, 20 write, 5 out — all at gpt-6-astra (turn_context);
+    // r0 precedes nothing priced differently (same file, same model).
+    let astra = (400 * 10 + 600 * 1 + 50 * 50 + 300 * 10 + 20 * 12.5 + 5 * 50) / 1_000_000.0
+    check(abs((cxu.cost[codexDay]?.usd ?? 0) - astra) < 1e-12 && cxu.tokens == cr,
+          "extractCodexDailyUsage: priced at the preceding turn_context model (got \(cxu.cost))")
+    check(extractCodexDailyUsage(codexEvents).cost[codexDay]?.unpriced == 1375,
+          "extractCodexDailyUsage: no turn_context -> unpriced")
+    var cl = CostLedger()
+    check(cl.merge(provider: "claude", daily: ["2026-09-25": DayCost(usd: 5, unpriced: 1)]), "CostLedger.merge: first merge changes")
+    _ = cl.merge(provider: "claude", daily: ["2026-09-25": DayCost(usd: 3, unpriced: 4)])
+    check(cl.days["2026-09-25"]?["claude"] == DayCost(usd: 5, unpriced: 4), "CostLedger.merge: per-field max, never adds")
+    var cl2 = CostLedger()
+    _ = cl2.merge(provider: "claude", daily: ["2026-09-25": DayCost(usd: 7), "2026-09-01": DayCost(usd: 1)])
+    let clm = CostLedger.merged(cl, cl2)
+    check(clm.days["2026-09-25"]?["claude"] == DayCost(usd: 7, unpriced: 4) && clm.days["2026-09-01"] != nil,
+          "CostLedger.merged: max per field, union of days")
+    let cs = clm.stats(provider: "claude", today: "2026-09-26")
+    check(cs.today == DayCost() && cs.last7 == DayCost(usd: 7, unpriced: 4) && cs.last30 == DayCost(usd: 8, unpriced: 4),
+          "CostLedger.stats: today / 7d / 30d windows")
+    var costed = TokenStats(
+        today: TokenTotals(input: 1200, output: 48, cacheRead: 100), last7: TokenTotals(input: 7), prev7: nil,
+        last30: TokenTotals(input: 30), prev30: nil)
+    costed.cost = CostStats(today: DayCost(usd: 12.34), last7: DayCost(usd: 50, unpriced: 3), last30: DayCost(usd: 1234))
+    let costedTitles = tokenMenuTitles(costed)
+    check(costedTitles.today == "Tokens today: 1.2K in · 48 out · 100 cache · ≈$12.34"
+          && costedTitles.history == ["Tokens 7d: 7 in · 0 out · 0 cache · ≈$50.00+ · — vs prior 7d",
+                                      "Tokens 30d: 30 in · 0 out · 0 cache · ≈$1,234 · — vs prior 30d"],
+          "tokenMenuTitles: cost after the tokens, before the trend (got \(costedTitles))")
+
     // updateTokenHistory: backfill, subagents, deleted-file preservation, cache reuse, corrupt ledger quarantine.
     let histBase = FileManager.default.temporaryDirectory.appendingPathComponent("pulse-hist-\(UUID().uuidString)")
     let histRoot = histBase.appendingPathComponent("projects")
@@ -2220,7 +2232,7 @@ if CommandLine.arguments.contains("--selftest") {
     let oldFile = histProj.appendingPathComponent("old.jsonl")
     try? (aLine("d", h1, "\"input_tokens\":100") + "\n").write(to: oldFile, atomically: true, encoding: .utf8)
     var histReads = 0
-    let counting: (String) -> [String: TokenTotals] = { histReads += 1; return extractDailyTotals($0) }
+    let counting: (String) -> DailyUsage = { histReads += 1; return extractDailyUsage($0) }
     let s1 = updateTokenHistory(provider: "claude", root: histRoot, extract: counting, home: histHome, now: histNow)
     check(s1?.today == TokenTotals(input: 10, output: 7) && s1?.last7 == TokenTotals(input: 113, output: 7) && histReads == 3,
           "updateTokenHistory: backfill incl. subagents (got \(String(describing: s1)) reads \(histReads))")
@@ -2241,6 +2253,19 @@ if CommandLine.arguments.contains("--selftest") {
           "updateTokenHistory: corrupt ledger quarantined (\(histNames))")
     check(updateTokenHistory(provider: "claude", root: histBase.appendingPathComponent("nope"), extract: counting, home: histHome, now: histNow) == nil,
           "updateTokenHistory: missing root -> nil")
+    // Cost: an unpriced model (aLine has none) is a lower bound; the cost ledger is its own file
+    // and a cost-cache-only miss still re-reads (the shared token cache may be another app's).
+    check(s4?.cost?.today == DayCost(usd: 0, unpriced: 22) && s4?.cost?.last7.unpriced == 125,
+          "updateTokenHistory: cost stats from the cost ledger (got \(String(describing: s4?.cost)))")
+    check(FileManager.default.fileExists(atPath: histHome.appendingPathComponent("cost-history.json").path)
+          && FileManager.default.fileExists(atPath: histHome.appendingPathComponent("cache/claude-cost-files.json").path),
+          "updateTokenHistory: cost ledger and cost cache persisted")
+    try? FileManager.default.removeItem(at: histHome.appendingPathComponent("cache/claude-cost-files.json"))
+    let readsBefore = histReads
+    _ = updateTokenHistory(provider: "claude", root: histRoot, extract: counting, home: histHome, now: histNow)
+    check(histReads == readsBefore + 2, "updateTokenHistory: missing cost cache re-reads live files (reads \(histReads - readsBefore))")
+    let ledgerBytes = (try? String(contentsOf: histHome.appendingPathComponent("token-history.json"), encoding: .utf8)) ?? ""
+    check(!ledgerBytes.contains("usd"), "updateTokenHistory: shared token ledger format untouched")
     try? FileManager.default.removeItem(at: histBase)
 
     // extractLastCodexModel: last turn_context wins; other record types and junk are skipped.

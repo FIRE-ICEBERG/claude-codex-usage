@@ -18,13 +18,15 @@ private func codexTotals(_ usage: [String: Any]) -> TokenTotals {
                        cacheRead: cached, cacheCreate: tokenInt(usage["cache_write_input_tokens"]))
 }
 
-/// Bucket per-response usage by the local date of the record timestamp.
-func extractCodexDailyTotals(_ content: String) -> DailyTotals {
-    var fromRecords = DailyTotals()
-    var fromEvents = DailyTotals()
+/// Bucket per-response usage by the local date of the record timestamp. The model a response
+/// is priced at is the `payload.model` of the latest preceding `turn_context` record.
+func extractCodexDailyUsage(_ content: String) -> DailyUsage {
+    var fromRecords = DailyUsage()
+    var fromEvents = DailyUsage()
     var haveRecords = false
     var seenResponses = Set<String>()
     var prevEvent: NSDictionary?
+    var model: String?
     for line in content.split(separator: "\n", omittingEmptySubsequences: true) {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty,
@@ -34,21 +36,33 @@ func extractCodexDailyTotals(_ content: String) -> DailyTotals {
             continue
         }
         let day = tokenRecordDate(obj["timestamp"]).map(localDateKey)
-        if obj["type"] as? String == "token_usage_record", let usage = payload["usage"] as? [String: Any] {
+        if obj["type"] as? String == "turn_context" {
+            if let m = payload["model"] as? String, !m.isEmpty { model = m }
+        } else if obj["type"] as? String == "token_usage_record", let usage = payload["usage"] as? [String: Any] {
             haveRecords = true
             if let id = payload["response_id"] as? String, !id.isEmpty {
                 if seenResponses.contains(id) { continue }
                 seenResponses.insert(id)
             }
-            if let day { fromRecords[day] = (fromRecords[day] ?? TokenTotals()) + codexTotals(usage) }
+            if let day {
+                let t = codexTotals(usage)
+                fromRecords.add(day, t, responseCost(t, model: model))
+            }
         } else if obj["type"] as? String == "event_msg", payload["type"] as? String == "token_count",
                   let info = payload["info"] as? [String: Any],
                   let last = info["last_token_usage"] as? [String: Any] {
             let key = last as NSDictionary
             if let prev = prevEvent, prev.isEqual(to: last) { continue }
             prevEvent = key
-            if let day { fromEvents[day] = (fromEvents[day] ?? TokenTotals()) + codexTotals(last) }
+            if let day {
+                let t = codexTotals(last)
+                fromEvents.add(day, t, responseCost(t, model: model))
+            }
         }
     }
     return haveRecords ? fromRecords : fromEvents
+}
+
+func extractCodexDailyTotals(_ content: String) -> DailyTotals {
+    extractCodexDailyUsage(content).tokens
 }

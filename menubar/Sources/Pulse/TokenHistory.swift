@@ -7,6 +7,10 @@ import Foundation
 /// Files under `$PULSE_HOME` (default `~/.pulse`); all apps read and write the same ones:
 ///   token-history.json          — the ledger: {version, since: {provider: date}, days: {date: {provider: totals}}}
 ///   cache/<provider>-files.json — per-transcript parse cache: {version, files: {path: {mtime, size, days}}}
+/// and, menubar-only (the other ports neither read nor rewrite them), the estimated cost:
+///   cost-history.json                — {version, days: {date: {provider: {usd, unpriced}}}}
+///   cache/<provider>-cost-files.json — {version, files: {path: {mtime, size, days: {date: {usd, unpriced}}}}}
+/// Kept apart so the shared token ledger keeps its exact format; same max rule, same merge.
 ///
 /// The one rule that keeps this correct with deletions and several writers: a day's value in the
 /// ledger is the per-field MAX of what has ever been observed for it. A day's total only grows
@@ -100,12 +104,93 @@ struct TokenLedger: Codable {
     }
 }
 
+/// Menubar-only estimated cost ledger; same max-per-field rule as `TokenLedger`.
+struct CostLedger: Codable {
+    var version: Int = 1
+    var days: [String: [String: DayCost]] = [:]
+
+    mutating func merge(provider: String, daily: DailyCost) -> Bool {
+        var changed = false
+        for (date, cost) in daily {
+            var day = days[date] ?? [:]
+            let merged = DayCost.max(day[provider] ?? DayCost(), cost)
+            if day[provider] != merged {
+                day[provider] = merged
+                days[date] = day
+                changed = true
+            }
+        }
+        return changed
+    }
+
+    static func merged(_ a: CostLedger, _ b: CostLedger) -> CostLedger {
+        var out = CostLedger()
+        for src in [a, b] {
+            for (date, providers) in src.days {
+                var day = out.days[date] ?? [:]
+                for (provider, cost) in providers {
+                    day[provider] = DayCost.max(day[provider] ?? DayCost(), cost)
+                }
+                out.days[date] = day
+            }
+        }
+        return out
+    }
+
+    func sum(provider: String, from: String, to: String) -> DayCost {
+        var total = DayCost()
+        for (date, providers) in days where date >= from && date <= to {
+            if let c = providers[provider] { total = total + c }
+        }
+        return total
+    }
+
+    func stats(provider: String, today: String) -> CostStats {
+        CostStats(today: sum(provider: provider, from: today, to: today),
+                  last7: sum(provider: provider, from: dateShift(today, -6), to: today),
+                  last30: sum(provider: provider, from: dateShift(today, -29), to: today))
+    }
+
+    mutating func prune(today: String) {
+        let cutoff = dateShift(today, -ledgerRetentionDays)
+        for date in days.keys where date < cutoff { days.removeValue(forKey: date) }
+    }
+}
+
+struct CostStats: Equatable {
+    let today: DayCost
+    let last7: DayCost
+    let last30: DayCost
+}
+
 struct TokenStats: Equatable {
     let today: TokenTotals
     let last7: TokenTotals
     let prev7: TokenTotals?   // nil until the ledger covers the prior window
     let last30: TokenTotals
     let prev30: TokenTotals?
+    /// Estimated API-price cost of the same windows (menubar-only); nil → no cost text.
+    var cost: CostStats? = nil
+}
+
+/// Several profiles' stats for one account, added up (each config dir has its own transcripts,
+/// so nothing is counted twice). A prior window is known only when every part knows it; cost is
+/// summed over the parts that have it. Empty → nil (no rows).
+func combinedTokenStats(_ parts: [TokenStats]) -> TokenStats? {
+    guard var out = parts.first else { return nil }
+    for p in parts.dropFirst() {
+        func both(_ a: TokenTotals?, _ b: TokenTotals?) -> TokenTotals? {
+            guard let a, let b else { return nil }
+            return a + b
+        }
+        var cost = out.cost ?? p.cost
+        if let a = out.cost, let b = p.cost {
+            cost = CostStats(today: a.today + b.today, last7: a.last7 + b.last7, last30: a.last30 + b.last30)
+        }
+        out = TokenStats(today: out.today + p.today, last7: out.last7 + p.last7, prev7: both(out.prev7, p.prev7),
+                         last30: out.last30 + p.last30, prev30: both(out.prev30, p.prev30), cost: cost)
+    }
+    return out
 }
 
 struct TokenRow: Equatable {
@@ -138,11 +223,15 @@ func trendText(_ cur: TokenTotals, _ prev: TokenTotals?) -> String {
 }
 
 /// The three rows every port renders (label styling / prefixing is per surface).
+/// With cost data, each row's token text is followed by " · ≈$X" (before the 7d / 30d trend).
 func tokenRows(_ s: TokenStats) -> [TokenRow] {
-    [
-        TokenRow(label: "Tokens today", value: tokenTotalsText(s.today)),
-        TokenRow(label: "Tokens 7d", value: "\(tokenTotalsText(s.last7)) · \(trendText(s.last7, s.prev7)) vs prior 7d"),
-        TokenRow(label: "Tokens 30d", value: "\(tokenTotalsText(s.last30)) · \(trendText(s.last30, s.prev30)) vs prior 30d"),
+    func text(_ t: TokenTotals, _ c: DayCost?) -> String {
+        tokenTotalsText(t) + (c.map { " · \(formatUSD($0))" } ?? "")
+    }
+    return [
+        TokenRow(label: "Tokens today", value: text(s.today, s.cost?.today)),
+        TokenRow(label: "Tokens 7d", value: "\(text(s.last7, s.cost?.last7)) · \(trendText(s.last7, s.prev7)) vs prior 7d"),
+        TokenRow(label: "Tokens 30d", value: "\(text(s.last30, s.cost?.last30)) · \(trendText(s.last30, s.prev30)) vs prior 30d"),
     ]
 }
 
@@ -173,6 +262,17 @@ private struct FileCache: Codable {
     var files: [String: FileCacheEntry] = [:]
 }
 
+private struct CostCacheEntry: Codable {
+    let mtime: Int64
+    let size: Int
+    let days: DailyCost
+}
+
+private struct CostCache: Codable {
+    var version: Int = 1
+    var files: [String: CostCacheEntry] = [:]
+}
+
 private func loadJSON<T: Decodable>(_ type: T.Type, at url: URL) -> (value: T?, present: Bool) {
     guard let data = try? Data(contentsOf: url) else { return (nil, false) }
     return (try? JSONDecoder().decode(type, from: data), true)
@@ -188,20 +288,29 @@ private func writeAtomic<T: Encodable>(_ value: T, to url: URL) {
 private func loadLedger(at url: URL) -> TokenLedger {
     let loaded = loadJSON(TokenLedger.self, at: url)
     if let l = loaded.value, l.version == 1 { return l }
-    if loaded.present {
-        let quarantined = url.appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970 * 1000))")
-        try? FileManager.default.moveItem(at: url, to: quarantined)
-    }
+    if loaded.present { quarantine(url) }
     return TokenLedger()
+}
+
+private func loadCostLedger(at url: URL) -> CostLedger {
+    let loaded = loadJSON(CostLedger.self, at: url)
+    if let l = loaded.value, l.version == 1 { return l }
+    if loaded.present { quarantine(url) }
+    return CostLedger()
+}
+
+private func quarantine(_ url: URL) {
+    let quarantined = url.appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970 * 1000))")
+    try? FileManager.default.moveItem(at: url, to: quarantined)
 }
 
 private let tokenHistoryLock = NSLock()
 
-/// One poll for a provider: parse changed transcripts under `root` (per-file cache), fold the
-/// per-day totals into the shared ledger, persist both atomically, and return the stats to
-/// display. `nil` when `root` does not exist, so callers omit the rows.
+/// One poll for a provider: parse changed transcripts under `root` (per-file caches), fold the
+/// per-day totals into the shared ledger and the costs into the cost ledger, persist atomically,
+/// and return the stats to display. `nil` when `root` does not exist, so callers omit the rows.
 func updateTokenHistory(
-    provider: String, root: URL, extract: (String) -> DailyTotals,
+    provider: String, root: URL, extract: (String) -> DailyUsage,
     home: URL = pulseHome(), now: Date = Date()
 ) -> TokenStats? {
     let fm = FileManager.default
@@ -216,10 +325,14 @@ func updateTokenHistory(
     let cacheURL = cacheDir.appendingPathComponent("\(provider)-files.json")
     var cache = loadJSON(FileCache.self, at: cacheURL).value ?? FileCache()
     if cache.version != 1 { cache = FileCache() }
+    let costCacheURL = cacheDir.appendingPathComponent("\(provider)-cost-files.json")
+    var costCache = loadJSON(CostCache.self, at: costCacheURL).value ?? CostCache()
+    if costCache.version != 1 { costCache = CostCache() }
     let cutoff = now.addingTimeInterval(-Double(scanWindowDays) * 86_400)
 
     var live = Set<String>()
     var cacheChanged = false
+    var costCacheChanged = false
     if let enumerator = fm.enumerator(
         at: root, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey], options: [.skipsHiddenFiles]
     ) {
@@ -230,17 +343,33 @@ func updateTokenHistory(
             live.insert(key)
             let mtime = Int64((modified.timeIntervalSince1970 * 1000).rounded())
             let size = values?.fileSize ?? -1
-            if let hit = cache.files[key], hit.mtime == mtime, hit.size == size { continue }
+            let tokensHit = cache.files[key].map { $0.mtime == mtime && $0.size == size } ?? false
+            let costHit = costCache.files[key].map { $0.mtime == mtime && $0.size == size } ?? false
+            if tokensHit && costHit { continue }
+            // One read and parse feeds whichever cache is stale (the token cache is shared with
+            // the other ports, which never write the cost cache).
             guard let content = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            cache.files[key] = FileCacheEntry(mtime: mtime, size: size, days: extract(content))
-            cacheChanged = true
+            let usage = extract(content)
+            if !tokensHit {
+                cache.files[key] = FileCacheEntry(mtime: mtime, size: size, days: usage.tokens)
+                cacheChanged = true
+            }
+            if !costHit {
+                costCache.files[key] = CostCacheEntry(mtime: mtime, size: size, days: usage.cost)
+                costCacheChanged = true
+            }
         }
     }
     for key in cache.files.keys where !live.contains(key) {
         cache.files.removeValue(forKey: key)
         cacheChanged = true
     }
+    for key in costCache.files.keys where !live.contains(key) {
+        costCache.files.removeValue(forKey: key)
+        costCacheChanged = true
+    }
     if cacheChanged { writeAtomic(cache, to: cacheURL) }
+    if costCacheChanged { writeAtomic(costCache, to: costCacheURL) }
 
     var daily = DailyTotals()
     for entry in cache.files.values {
@@ -257,15 +386,32 @@ func updateTokenHistory(
         ledger.prune(today: today)
         writeAtomic(ledger, to: ledgerURL)
     }
-    return ledger.stats(provider: provider, today: today)
+
+    var dailyCost = DailyCost()
+    for entry in costCache.files.values {
+        for (date, cost) in entry.days { dailyCost[date] = (dailyCost[date] ?? DayCost()) + cost }
+    }
+    let costURL = home.appendingPathComponent("cost-history.json")
+    var costLedger = loadCostLedger(at: costURL)
+    if costLedger.merge(provider: provider, daily: dailyCost) {
+        if let onDisk = loadJSON(CostLedger.self, at: costURL).value, onDisk.version == 1 {
+            costLedger = CostLedger.merged(onDisk, costLedger)
+        }
+        costLedger.prune(today: today)
+        writeAtomic(costLedger, to: costURL)
+    }
+
+    var stats = ledger.stats(provider: provider, today: today)
+    stats.cost = costLedger.stats(provider: provider, today: today)
+    return stats
 }
 
 /// Per-provider entry points used by the poll loop.
 func readTokenStats(profile: ClaudeProfile = .makeDefault()) -> TokenStats? {
     updateTokenHistory(
-        provider: profile.ledgerProvider, root: profile.home.projectsURL, extract: extractDailyTotals)
+        provider: profile.ledgerProvider, root: profile.home.projectsURL, extract: extractDailyUsage)
 }
 
 func readCodexTokenStats() -> TokenStats? {
-    updateTokenHistory(provider: "codex", root: codexHome().appendingPathComponent("sessions"), extract: extractCodexDailyTotals)
+    updateTokenHistory(provider: "codex", root: codexHome().appendingPathComponent("sessions"), extract: extractCodexDailyUsage)
 }

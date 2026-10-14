@@ -39,11 +39,23 @@ func tokenInt(_ v: Any?) -> Int {
     return 0
 }
 
+/// Per-day token totals and their estimated cost (see `Pricing.swift`) from one parse.
+struct DailyUsage: Equatable {
+    var tokens = DailyTotals()
+    var cost = DailyCost()
+
+    mutating func add(_ day: String, _ t: TokenTotals, _ c: DayCost) {
+        tokens[day] = (tokens[day] ?? TokenTotals()) + t
+        cost[day] = (cost[day] ?? DayCost()) + c
+    }
+}
+
 /// Bucket `message.usage` of the `assistant` records by the local date of their `timestamp`.
 /// Claude Code writes one `assistant` line per content block of a response; those lines share
 /// `message.id` with identical usage, so each id counts once. `usage.iterations[]` is ignored.
-func extractDailyTotals(_ content: String) -> DailyTotals {
-    var days = DailyTotals()
+/// Cost uses `message.model`, the 1-hour part of `usage.cache_creation`, and `usage.speed`.
+func extractDailyUsage(_ content: String) -> DailyUsage {
+    var out = DailyUsage()
     var seen = Set<String>()
     for line in content.split(separator: "\n", omittingEmptySubsequences: true) {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -60,14 +72,22 @@ func extractDailyTotals(_ content: String) -> DailyTotals {
             if seen.contains(id) { continue }
             seen.insert(id)
         }
-        let key = localDateKey(date)
-        days[key] = (days[key] ?? TokenTotals()) + TokenTotals(
+        let totals = TokenTotals(
             input: tokenInt(usage["input_tokens"]),
             output: tokenInt(usage["output_tokens"]),
             cacheRead: tokenInt(usage["cache_read_input_tokens"]),
             cacheCreate: tokenInt(usage["cache_creation_input_tokens"]))
+        let write1h = tokenInt((usage["cache_creation"] as? [String: Any])?["ephemeral_1h_input_tokens"])
+        let cost = responseCost(
+            totals, model: message["model"] as? String, cacheWrite1h: write1h,
+            multiplier: usage["speed"] as? String == "fast" ? 2 : 1)
+        out.add(localDateKey(date), totals, cost)
     }
-    return days
+    return out
+}
+
+func extractDailyTotals(_ content: String) -> DailyTotals {
+    extractDailyUsage(content).tokens
 }
 
 /// 0 → "0", 1234 → "1.2K", 48000 → "48K", 9_800_000 → "9.8M", 13_500_000 → "14M", 2.1e9 → "2.1B".

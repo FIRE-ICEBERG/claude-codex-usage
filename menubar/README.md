@@ -57,7 +57,7 @@ Each of these prints or renders once and exits, without starting the menu-bar it
 | `--once` | Print the current Claude values |
 | `--codex-once` | Print the current Codex values |
 | `--codex-wakeup` | Send one Codex Auto Wakeup request and print the result (spends a tiny amount of Codex quota) |
-| `--selftest` | Run the unit tests (pure functions: formatting, credentials, usage parsing, Auto Wakeup). Exits non-zero on failure — this is the project's test command |
+| `--selftest` | Run the unit tests (pure functions: formatting, credentials, usage parsing, Auto Wakeup, usage surge). Exits non-zero on failure — this is the project's test command |
 | `--menu <out.png>` | Render the dropdown offscreen to a PNG (column-alignment regression check) |
 | `--dark` | Combined with `--menu`, renders under the dark appearance so colour choices can be checked in both themes |
 | `--about` | Render the About window to a PNG |
@@ -214,6 +214,21 @@ Escape hatch (the app must not be running):
 defaults write com.wemeet.pulse AutoWakeupEnabled -bool false   # force off
 defaults delete com.wemeet.pulse AutoWakeupEnabled              # back to the default (off)
 ```
+
+## Usage surge
+
+Always on, no network. Pulse keeps the last ~2 hours of each provider's 5h value and compares two
+hourly buckets: when **this hour added at least 1.5× what the hour before added, and at least
+10 %p**, the menu-bar 5h number gets a `▲` suffix and the provider's section shows
+"⚠ 5h usage surge: +15% this hour, +8% the hour before". The mark clears on its own once the pace
+drops back.
+
+- Only *increases* between polls are counted, so a window reset (Claude drops to 0 on the hour)
+  or Codex's rolling decay never distorts a bucket, and the hour before a reset still serves as
+  the baseline.
+- The first verdict needs 2 hours of samples after launch, and after any gap longer than 20
+  minutes (sleep, restart) the history starts over. Nothing is shown in the meantime.
+- Thresholds are constants in `UsageSpike.swift` (`spikeRatio`, `spikeFloor`).
 
 ## Settings / fine-tuning
 

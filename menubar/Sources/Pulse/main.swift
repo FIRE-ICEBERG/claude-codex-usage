@@ -25,6 +25,8 @@ final class ClaudeProfileState {
     var timer: Timer?
     var wakeup: WakeupState
     var wakeupInFlight = false
+    /// Last ~2h of 5h values for the usage surge signal (UsageSpike.swift). Memory only.
+    var samples: [UsageSample] = []
 
     init(profile: ClaudeProfile, wakeup: WakeupState) {
         self.profile = profile
@@ -113,6 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var aboutWindow: NSWindow?
     private var lastCodexUsage: CodexUsage?
+    private var codexSamples: [UsageSample] = []
     private var lastCodexModel: CurrentModel?
     private var lastCodexTokens: TokenStats?
     private var lastCodexUpdated: Date?
@@ -639,6 +642,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func renderCodexUsage(_ usage: CodexUsage, _ model: CurrentModel?, _ tokens: TokenStats?) {
         lastCodexUsage = usage
+        codexSamples = recordSample(codexSamples, pct: Double(usage.fiveHour.usedPercent))
         lastCodexModel = model
         lastCodexTokens = tokens
         lastCodexUpdated = Date()
@@ -665,6 +669,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ state: ClaudeProfileState, _ usage: UsageData, _ model: CurrentModel?, _ tokens: TokenStats?
     ) {
         state.usage = usage
+        state.samples = recordSample(state.samples, pct: usage.fiveHour.utilization)
         state.model = model
         state.tokens = tokens
         state.updated = Date()
@@ -695,6 +700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let notes = claudeStatusNotes(
             hasValue: state.usage != nil, error: state.lastError?.localizedDescription,
             loginNeeded: state.loginNeeded, retryDelay: state.retryDelay, stale: isStale(state))
+            + (currentSpike(state.samples).map { [spikeNote($0)] } ?? [])
         // A profile hidden as a duplicate of this account still has its own transcripts (each
         // config dir has its own projects/), so its tokens and model show here instead of vanishing.
         let sameAccount = sameAccountStates(state)
@@ -760,7 +766,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 codexRows.append(UsageRow(label: "Weekly", pct: weekly.usedPercent,
                                           reset: formatResetDuration(weekly.resetsAt)))
             }
-            let notes = codexError.map { ["⚠ Refresh failed — showing last value", $0.localizedDescription] } ?? []
+            let notes = (codexError.map { ["⚠ Refresh failed — showing last value", $0.localizedDescription] } ?? [])
+                + (currentSpike(codexSamples).map { [spikeNote($0)] } ?? [])
             codexSection = ProviderSection(rows: codexRows, model: lastCodexModel, tokens: lastCodexTokens, notes: notes)
         } else if let error = codexError {
             codexSection = ProviderSection(rows: [], model: nil, tokens: lastCodexTokens, notes: [error.localizedDescription])
@@ -785,11 +792,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // A stale primary value is grayed (error contract); Codex keeps its own colour.
         let stale = isStale(primary)
+        let claudeMark = spikeMark(currentSpike(primary.samples))
         if let codex = lastCodexUsage {
             let claudePercent = pct(usage.fiveHour.utilization)
             setStacked(
-                top: "\(claudePercent)%",
-                bottom: "\(codex.fiveHour.usedPercent)%",
+                top: "\(claudePercent)%\(claudeMark)",
+                bottom: "\(codex.fiveHour.usedPercent)%\(spikeMark(currentSpike(codexSamples)))",
                 topColor: stale ? .systemGray : colorForPercent(claudePercent),
                 bottomColor: colorForPercent(codex.fiveHour.usedPercent),
                 topGauge: resetProgress(until: usage.fiveHour.resetsAt),
@@ -802,7 +810,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ].joined(separator: "\n")
         } else {
             setStacked(
-                top: "\(pct(usage.fiveHour.utilization))%",
+                top: "\(pct(usage.fiveHour.utilization))%\(claudeMark)",
                 bottom: "\(pct(usage.sevenDay.utilization))%",
                 color: stale ? .systemGray : colorForPeak(peakUtilization(usage)))
             statusItem.button?.toolTip = nil
@@ -817,7 +825,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setStacked(top: "Login", bottom: "needed", color: .systemRed)
         } else if let codex = lastCodexUsage {
             setStacked(
-                top: "··", bottom: "\(codex.fiveHour.usedPercent)%",
+                top: "··", bottom: "\(codex.fiveHour.usedPercent)%\(spikeMark(currentSpike(codexSamples)))",
                 topColor: .systemGray, bottomColor: colorForPercent(codex.fiveHour.usedPercent),
                 bottomGauge: resetProgress(until: codex.fiveHour.resetsAt),
                 topIcon: lineIcon(.claude), bottomIcon: lineIcon(.codex))
@@ -2370,6 +2378,48 @@ if CommandLine.arguments.contains("--selftest") {
     check(stateAfterWakeup(emptyState, resetsAt: t0.addingTimeInterval(5 * 3600), now: t0)
             .lastWindowResetsAt == t0.addingTimeInterval(5 * 3600),
           "stateAfterWakeup records the observed window")
+
+    // UsageSpike.swift: hourly buckets of gross gain, no reset detection, gap restarts history.
+    func samplesAt(_ values: [Double], every step: TimeInterval = 300, endingAt end: Date) -> [UsageSample] {
+        values.enumerated().map { i, v in
+            UsageSample(at: end.addingTimeInterval(-Double(values.count - 1 - i) * step), pct: v)
+        }
+    }
+    let spikeT = t0.addingTimeInterval(3 * 3600)
+    check(recordSample([], pct: 5, now: t0) == [UsageSample(at: t0, pct: 5)], "recordSample: first sample")
+    check(recordSample([UsageSample(at: t0, pct: 5)], pct: 6, now: t0.addingTimeInterval(300)).count == 2,
+          "recordSample: appends within the gap limit")
+    check(recordSample([UsageSample(at: t0, pct: 5)], pct: 40, now: t0.addingTimeInterval(spikeMaxGap + 1))
+            == [UsageSample(at: t0.addingTimeInterval(spikeMaxGap + 1), pct: 40)],
+          "recordSample: a long gap (restart / sleep) restarts the history")
+    let old = UsageSample(at: spikeT.addingTimeInterval(-(2 * spikeBucket + spikeMaxGap) - 1), pct: 1)
+    let kept = UsageSample(at: spikeT.addingTimeInterval(-60), pct: 2)
+    check(recordSample([old, kept], pct: 3, now: spikeT).first == kept,
+          "recordSample: prunes samples older than two buckets plus the gap")
+
+    check(spikeReading(samplesAt([0, 5, 10], endingAt: spikeT), now: spikeT) == nil,
+          "spikeReading: nil until the hour-before bucket is fully covered")
+    // 25 samples at 5-min steps = 2h: +8%p over the first hour, +15%p over the second.
+    let steady = samplesAt([0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8, 8, 10, 12, 14, 16, 18, 20, 21, 22, 23, 23, 23, 23], endingAt: spikeT)
+    check(spikeReading(steady, now: spikeT) == SpikeReading(thisHour: 15, lastHour: 8),
+          "spikeReading: buckets gross gain per hour (got \(String(describing: spikeReading(steady, now: spikeT))))")
+    // Same consumption, but the window reset to 0 mid-way: the drop is ignored, not subtracted.
+    let reset = samplesAt([80, 81, 82, 83, 84, 85, 86, 87, 88, 88, 88, 88, 88, 0, 2, 4, 6, 8, 10, 11, 12, 13, 13, 13, 13], endingAt: spikeT)
+    check(spikeReading(reset, now: spikeT) == SpikeReading(thisHour: 13, lastHour: 8),
+          "spikeReading: a window reset counts as 0, never negative")
+    let decay = samplesAt([20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], endingAt: spikeT)
+    check(spikeReading(decay, now: spikeT) == SpikeReading(thisHour: 0, lastHour: 0),
+          "spikeReading: Codex-style rolling decay adds nothing")
+
+    check(isSpike(SpikeReading(thisHour: 15, lastHour: 8)), "isSpike: 15 vs 8 -> surge")
+    check(!isSpike(SpikeReading(thisHour: 3, lastHour: 2)), "isSpike: below the floor is noise, not a surge")
+    check(!isSpike(SpikeReading(thisHour: 12, lastHour: 10)), "isSpike: under 1.5x is not a surge")
+    check(isSpike(SpikeReading(thisHour: 10, lastHour: 0)), "isSpike: idle -> busy counts")
+    check(currentSpike(steady, now: spikeT) != nil && currentSpike(decay, now: spikeT) == nil,
+          "currentSpike: reading only while it is a surge")
+    check(spikeNote(SpikeReading(thisHour: 15.4, lastHour: 8)) == "⚠ 5h usage surge: +15% this hour, +8% the hour before",
+          "spikeNote text")
+    check(spikeMark(nil) == "" && spikeMark(SpikeReading(thisHour: 15, lastHour: 8)) == "▲", "spikeMark")
 
     // wakeupStatusLine: English only, per CLAUDE.md.
     check(wakeupStatusLine(enabled: false, state: emptyState, now: t0) == "Auto Wakeup: off",

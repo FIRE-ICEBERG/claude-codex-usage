@@ -67,6 +67,12 @@ contract below. Codex never omits its reset time: an idle Codex window reports a
 `CodexUsageWindow.idle` via `codexWindowIsIdle`), and the call site maps `idle` to an absent reset
 before `shouldWakeUp`. Keying Codex on `resetsAt == nil` alone never fires.
 
+`menubar/` also contains `UsageSpike.swift` (**menubar-only, not mirrored**): the 5h usage surge
+signal (`▲` after the menu-bar 5h number plus a section note) when this hour's gross gain is
+≥ 1.5× the hour before and ≥ 10 %p. It has **no reset detection by design** — only increases
+between consecutive polls are summed, which already neutralises Claude's clock-aligned drop and
+Codex's rolling decay; a gap > 20 min restarts the in-memory history. Always on, no network.
+
 ## Shared architecture (same 5 modules in every implementation)
 
 0. **Claude home** (`src/claudeHome.ts`, `tray-go/claude_home.go`, `menubar/.../ClaudeHome.swift`) — every Claude path derives from one config dir: `CLAUDE_CONFIG_DIR` (empty = unset) or `~/.claude`. Facts verified in the Claude Code binary, which all ports must match: the keychain service is `Claude Code-credentials` plus, **only for a `CLAUDE_CONFIG_DIR` home**, `-` + the first 8 hex of `sha256(configDir)` — hashed over the raw NFC string, no tilde expansion or realpath, so a trailing slash is a *different* item (vectors `/Users/test/.claude-work` → `03abf0ee`, with `/` → `8bd6f0f5`); the global config is `<configDir>/.config.json` if it exists (legacy), else `$CLAUDE_CONFIG_DIR/.claude.json` or `~/.claude.json`; credentials and `projects/` sit in the config dir. With the env unset, every path is what it always was.

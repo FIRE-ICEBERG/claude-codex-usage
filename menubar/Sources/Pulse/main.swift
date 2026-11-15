@@ -803,24 +803,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 topGauge: resetProgress(until: usage.fiveHour.resetsAt),
                 bottomGauge: resetProgress(until: codex.fiveHour.resetsAt),
                 topIcon: lineIcon(.claude), bottomIcon: lineIcon(.codex))
-            statusItem.button?.toolTip = [
+            setStatusToolTip([
                 "Claude 5h: \(formatResetIn(usage.fiveHour.resetsAt))",
                 "Codex 5h: \(formatResetIn(codex.fiveHour.resetsAt))",
                 "Each gauge segment is about 1h remaining.",
-            ].joined(separator: "\n")
+            ].joined(separator: "\n"))
         } else {
             setStacked(
                 top: "\(pct(usage.fiveHour.utilization))%\(claudeMark)",
                 bottom: "\(pct(usage.sevenDay.utilization))%",
                 color: stale ? .systemGray : colorForPeak(peakUtilization(usage)))
-            statusItem.button?.toolTip = nil
+            setStatusToolTip(nil)
         }
     }
 
     /// The menu-bar title while the primary Claude profile has no value: its login prompt, or a
     /// neutral `··` (gray once a poll failed) — next to Codex's 5h when Codex has a value.
     private func renderPrimaryPlaceholder() {
-        statusItem.button?.toolTip = nil
+        setStatusToolTip(nil)
         if primary.loginNeeded {
             setStacked(top: "Login", bottom: "needed", color: .systemRed)
         } else if let codex = lastCodexUsage {
@@ -855,6 +855,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if peak >= 0.95 { return .systemRed }
         if peak >= 0.8 { return .systemOrange }
         return nil
+    }
+
+    /// Re-assigning `toolTip` while it is on screen orphans the visible tooltip (AppKit), leaving it
+    /// stuck after the mouse leaves — so skip unchanged text and defer while the pointer is over the item.
+    private func setStatusToolTip(_ tip: String?) {
+        guard let button = statusItem.button, button.toolTip != tip else { return }
+        if let frame = button.window?.frame, frame.contains(NSEvent.mouseLocation) { return }
+        button.toolTip = tip
     }
 
     /// Display two stacked lines in the menu bar (network-speed-indicator style).

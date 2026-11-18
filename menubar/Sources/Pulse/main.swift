@@ -58,6 +58,7 @@ func claudeStatusNotes(
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
+    private var statusHoverTip: StatusHoverTip?
     private var codexTimer: Timer?
     private let interval: TimeInterval
 
@@ -281,6 +282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusHoverTip = statusItem.button.map(StatusHoverTip.init)
         renderAll()  // every section starts as "Loading..."
 
         refreshAll()
@@ -857,12 +859,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return nil
     }
 
-    /// Re-assigning `toolTip` while it is on screen orphans the visible tooltip (AppKit), leaving it
-    /// stuck after the mouse leaves — so skip unchanged text and defer while the pointer is over the item.
+    /// Never `button.toolTip`: AppKit's tooltip tracking for the status item goes stale and shows
+    /// the tip with the pointer elsewhere, where it sticks (see StatusHoverTip.swift).
     private func setStatusToolTip(_ tip: String?) {
-        guard let button = statusItem.button, button.toolTip != tip else { return }
-        if let frame = button.window?.frame, frame.contains(NSEvent.mouseLocation) { return }
-        button.toolTip = tip
+        statusHoverTip?.text = tip
     }
 
     /// Display two stacked lines in the menu bar (network-speed-indicator style).
